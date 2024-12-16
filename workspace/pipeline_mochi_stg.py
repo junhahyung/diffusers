@@ -35,7 +35,7 @@ from diffusers.video_processor import VideoProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.mochi.pipeline_mochi import MochiPipeline
 from diffusers.pipelines.mochi.pipeline_output import MochiPipelineOutput
-
+import torch.nn.functional as F
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -66,9 +66,10 @@ EXAMPLE_DOC_STRING = """
 class STGMochiAttnProcessor2_0:
     """Attention processor used in Mochi."""
 
-    def __init__(self):
+    def __init__(self, mode="STG-R"):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("MochiAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
+        self.mode = mode
 
     def __call__(
         self,
@@ -81,8 +82,8 @@ class STGMochiAttnProcessor2_0:
         hidden_states_neg, hidden_states_org, hidden_states_ptb = hidden_states.chunk(3)
         encoder_hidden_states_neg, encoder_hidden_states_org, encoder_hidden_states_ptb = encoder_hidden_states.chunk(3)
         
-        hidden_states_org = torch.cat([hidden_states_neg, hidden_states_org], dim=1)
-        encoder_hidden_states_org = torch.cat([encoder_hidden_states_neg, encoder_hidden_states_org], dim=1)
+        hidden_states_org = torch.cat([hidden_states_neg, hidden_states_org], dim=0)
+        encoder_hidden_states_org = torch.cat([encoder_hidden_states_neg, encoder_hidden_states_org], dim=0)
         
         query_org = attn.to_q(hidden_states_org)
         key_org = attn.to_k(hidden_states_org)
@@ -109,7 +110,7 @@ class STGMochiAttnProcessor2_0:
             encoder_query_org = attn.norm_added_q(encoder_query_org)
         if attn.norm_added_k is not None:
             encoder_key_org = attn.norm_added_k(encoder_key_org)
-
+        
         if image_rotary_emb is not None:
 
             def apply_rotary_emb(x, freqs_cos, freqs_sin):
@@ -154,78 +155,82 @@ class STGMochiAttnProcessor2_0:
         if getattr(attn, "to_add_out", None) is not None:
             encoder_hidden_states_org = attn.to_add_out(encoder_hidden_states_org)
 
-        #--------------ptb----------------#
-        query_ptb = attn.to_q(hidden_states_ptb)
-        key_ptb = attn.to_k(hidden_states_ptb)
-        value_ptb = attn.to_v(hidden_states_ptb)
+        if self.mode == "STG-A":
+            #--------------ptb----------------#
+            query_ptb = attn.to_q(hidden_states_ptb)
+            key_ptb = attn.to_k(hidden_states_ptb)
+            value_ptb = attn.to_v(hidden_states_ptb)
 
-        query_ptb = query_ptb.unflatten(2, (attn.heads, -1))
-        key_ptb = key_ptb.unflatten(2, (attn.heads, -1))
-        value_ptb = value_ptb.unflatten(2, (attn.heads, -1))
+            query_ptb = query_ptb.unflatten(2, (attn.heads, -1))
+            key_ptb = key_ptb.unflatten(2, (attn.heads, -1))
+            value_ptb = value_ptb.unflatten(2, (attn.heads, -1))
 
-        if attn.norm_q is not None:
-            query_ptb = attn.norm_q(query_ptb)
-        if attn.norm_k is not None:
-            key_ptb = attn.norm_k(key_ptb)
+            if attn.norm_q is not None:
+                query_ptb = attn.norm_q(query_ptb)
+            if attn.norm_k is not None:
+                key_ptb = attn.norm_k(key_ptb)
 
-        encoder_query_ptb = attn.add_q_proj(encoder_hidden_states_ptb)
-        encoder_key_ptb = attn.add_k_proj(encoder_hidden_states_ptb)
-        encoder_value_ptb = attn.add_v_proj(encoder_hidden_states_ptb)
+            encoder_query_ptb = attn.add_q_proj(encoder_hidden_states_ptb)
+            encoder_key_ptb = attn.add_k_proj(encoder_hidden_states_ptb)
+            encoder_value_ptb = attn.add_v_proj(encoder_hidden_states_ptb)
 
-        encoder_query_ptb = encoder_query_ptb.unflatten(2, (attn.heads, -1))
-        encoder_key_ptb = encoder_key_ptb.unflatten(2, (attn.heads, -1))
-        encoder_value_ptb = encoder_value_ptb.unflatten(2, (attn.heads, -1))
+            encoder_query_ptb = encoder_query_ptb.unflatten(2, (attn.heads, -1))
+            encoder_key_ptb = encoder_key_ptb.unflatten(2, (attn.heads, -1))
+            encoder_value_ptb = encoder_value_ptb.unflatten(2, (attn.heads, -1))
 
-        if attn.norm_added_q is not None:
-            encoder_query_ptb = attn.norm_added_q(encoder_query_ptb)
-        if attn.norm_added_k is not None:
-            encoder_key_ptb = attn.norm_added_k(encoder_key_ptb)
+            if attn.norm_added_q is not None:
+                encoder_query_ptb = attn.norm_added_q(encoder_query_ptb)
+            if attn.norm_added_k is not None:
+                encoder_key_ptb = attn.norm_added_k(encoder_key_ptb)
 
-        if image_rotary_emb is not None:
-            query_ptb = apply_rotary_emb(query_ptb, *image_rotary_emb)
-            key_ptb = apply_rotary_emb(key_ptb, *image_rotary_emb)
+            if image_rotary_emb is not None:
+                query_ptb = apply_rotary_emb(query_ptb, *image_rotary_emb)
+                key_ptb = apply_rotary_emb(key_ptb, *image_rotary_emb)
 
-        query_ptb, key_ptb, value_ptb = query_ptb.transpose(1, 2), key_ptb.transpose(1, 2), value_ptb.transpose(1, 2)
-        encoder_query_ptb, encoder_key_ptb, encoder_value_ptb = (
-            encoder_query_ptb.transpose(1, 2),
-            encoder_key_ptb.transpose(1, 2),
-            encoder_value_ptb.transpose(1, 2),
-        )
+            query_ptb, key_ptb, value_ptb = query_ptb.transpose(1, 2), key_ptb.transpose(1, 2), value_ptb.transpose(1, 2)
+            encoder_query_ptb, encoder_key_ptb, encoder_value_ptb = (
+                encoder_query_ptb.transpose(1, 2),
+                encoder_key_ptb.transpose(1, 2),
+                encoder_value_ptb.transpose(1, 2),
+            )
 
-        sequence_length_ptb = query_ptb.size(2)
-        encoder_sequence_length_ptb = encoder_query_ptb.size(2)
+            sequence_length_ptb = query_ptb.size(2)
+            encoder_sequence_length_ptb = encoder_query_ptb.size(2)
 
-        query_ptb = torch.cat([query_ptb, encoder_query_ptb], dim=2)
-        key_ptb = torch.cat([key_ptb, encoder_key_ptb], dim=2)
-        value_ptb = torch.cat([value_ptb, encoder_value_ptb], dim=2)
-        
-        full_sequence_length_ptb = query_ptb.size(2)
-        identity_block_size = query_ptb.size(2) - encoder_query_ptb.size(2)
-        
-        full_mask = torch.zeros((full_sequence_length_ptb, full_sequence_length_ptb), device=query_ptb.device, dtype=query_ptb.dtype)
-        
-        full_mask[:identity_block_size, :identity_block_size] = float("-inf")
-        full_mask[:identity_block_size, identity_block_size:].fill_diagonal_(0)
-        
-        full_mask = full_mask.unsqueeze(0).unsqueeze(0)
+            query_ptb = torch.cat([query_ptb, encoder_query_ptb], dim=2)
+            key_ptb = torch.cat([key_ptb, encoder_key_ptb], dim=2)
+            value_ptb = torch.cat([value_ptb, encoder_value_ptb], dim=2)
+            
+            full_sequence_length_ptb = query_ptb.size(2)
+            identity_block_size = query_ptb.size(2) - encoder_query_ptb.size(2)
+            
+            full_mask = torch.zeros((full_sequence_length_ptb, full_sequence_length_ptb), device=query_ptb.device, dtype=query_ptb.dtype)
+            
+            full_mask[:identity_block_size, :identity_block_size] = float("-inf")
+            full_mask[:identity_block_size, identity_block_size:].fill_diagonal_(0)
+            
+            full_mask = full_mask.unsqueeze(0).unsqueeze(0)
 
-        hidden_states_ptb = F.scaled_dot_product_attention(
-            query_ptb, key_ptb, value_ptb, attn_mask=full_mask, dropout_p=0.0, is_causal=False
-        )
-        hidden_states_ptb = hidden_states_ptb.transpose(1, 2).flatten(2, 3)
-        hidden_states_ptb = hidden_states_ptb.to(query_ptb.dtype)
+            hidden_states_ptb = F.scaled_dot_product_attention(
+                query_ptb, key_ptb, value_ptb, attn_mask=full_mask, dropout_p=0.0, is_causal=False
+            )
+            hidden_states_ptb = hidden_states_ptb.transpose(1, 2).flatten(2, 3)
+            hidden_states_ptb = hidden_states_ptb.to(query_ptb.dtype)
 
-        hidden_states_ptb, encoder_hidden_states_ptb = hidden_states_ptb.split_with_sizes(
-            (sequence_length_ptb, encoder_sequence_length_ptb), dim=1
-        )
+            hidden_states_ptb, encoder_hidden_states_ptb = hidden_states_ptb.split_with_sizes(
+                (sequence_length_ptb, encoder_sequence_length_ptb), dim=1
+            )
 
-        # linear proj
-        hidden_states_ptb = attn.to_out[0](hidden_states_ptb)
-        # dropout
-        hidden_states_ptb = attn.to_out[1](hidden_states_ptb)
+            # linear proj
+            hidden_states_ptb = attn.to_out[0](hidden_states_ptb)
+            # dropout
+            hidden_states_ptb = attn.to_out[1](hidden_states_ptb)
 
-        if getattr(attn, "to_add_out", None) is not None:
-            encoder_hidden_states_ptb = attn.to_add_out(encoder_hidden_states_ptb)
+            if getattr(attn, "to_add_out", None) is not None:
+                encoder_hidden_states_ptb = attn.to_add_out(encoder_hidden_states_ptb)
+
+        hidden_states = torch.cat([hidden_states_org, hidden_states_ptb], dim=0)
+        encoder_hidden_states = torch.cat([encoder_hidden_states_org, encoder_hidden_states_ptb], dim=0)
 
         return hidden_states, encoder_hidden_states
 
@@ -325,17 +330,17 @@ class STGMochiPipeline(MochiPipeline):
         layers = []
         with open(file_path, "w") as f:
             for name, module in self.transformer.named_modules():
-                if "attn1" in name and "to" not in name and "norm" not in name:
+                if "attn1" in name and "to" not in name and "add" not in name and "norm" not in name:
                     f.write(f"{name}\n")
                     layer_type = name.split(".")[0].split("_")[0]
                     layers.append((name, module))
+
         return layers
     
     def replace_layer_processor(self, layers, replace_processor, stg_applied_layers_idx=[]):
         for layer_idx in stg_applied_layers_idx:
             layers[layer_idx][1].processor = replace_processor
-            if not do_initialize:
-                print(f"[INFO] Replaced {layer_idx}th layer with STGMochiAttnProcessor2_0.")
+            print(f"[INFO] Replaced {layer_idx}th layer with STGMochiAttnProcessor2_0.")
 
         return
     
@@ -368,8 +373,10 @@ class STGMochiPipeline(MochiPipeline):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 256,
+        stg_mode: Optional[str] = "STG-R",
         stg_applied_layers_idx: Optional[List[int]] = [35],
         stg_scale: Optional[float] = 1.0,
+        do_rescaling: Optional[bool] = False,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -470,7 +477,7 @@ class STGMochiPipeline(MochiPipeline):
 
         if self.do_spatio_temporal_guidance:
             layers = self.extract_layers()
-            replace_processor = STGMochiAttnProcessor2_0()
+            replace_processor = STGMochiAttnProcessor2_0(mode=stg_mode)
             self.replace_layer_processor(layers, replace_processor, stg_applied_layers_idx)
 
         # 2. Define call parameters
@@ -567,7 +574,13 @@ class STGMochiPipeline(MochiPipeline):
                 elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
                     noise_pred_uncond, noise_pred_text, noise_pred_perturb = noise_pred.chunk(3)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) \
-                        + self.stg_scale * (noise_pred_cond - noise_pred_perturb)
+                        + self._stg_scale * (noise_pred_text - noise_pred_perturb)
+                        
+                if do_rescaling:
+                    rescaling_scale = 0.7
+                    factor = noise_pred_text.std() / noise_pred.std()
+                    factor = rescaling_scale * factor + (1 - rescaling_scale)
+                    noise_pred = noise_pred * factor
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
