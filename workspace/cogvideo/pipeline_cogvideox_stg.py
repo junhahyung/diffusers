@@ -456,10 +456,10 @@ class CogVideoXSTGPipeline(CogVideoXPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 226,
-        stg_mode: Optional[str] = "STG-R",
+        stg_mode: Optional[str] = "STG-A",
         stg_applied_layers_idx: Optional[List[int]] = [30],
-        stg_scale: Optional[float] = 0.0,
-        do_rescaling: Optional[bool] = False,
+        stg_scale: Optional[float] = 0.0, # 4.0
+        do_rescaling: Optional[bool] = False, # True
         
     ) -> Union[CogVideoXPipelineOutput, Tuple]:
         """
