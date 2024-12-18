@@ -29,9 +29,10 @@ from diffusers.schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler
 from diffusers.utils import logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
+from diffusers.models.attention_processor import Attention, CogVideoXAttnProcessor2_0, FusedCogVideoXAttnProcessor2_0
 from diffusers.pipelines.cogvideo.pipeline_cogvideox import CogVideoXPipeline
 from diffusers.pipelines.cogvideo.pipeline_output import CogVideoXPipelineOutput
-
+import torch.nn.functional as F
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -58,7 +59,7 @@ EXAMPLE_DOC_STRING = """
         ```
 """
 
-class CogVideoXAttnProcessor2_0:
+class STGCogVideoXAttnProcessor2_0:
     r"""
     Processor for implementing scaled dot-product attention for the CogVideoX model. It applies a rotary embedding on
     query and key vectors, but does not include spatial normalization.
@@ -113,7 +114,7 @@ class CogVideoXAttnProcessor2_0:
 
         # Apply RoPE if needed
         if image_rotary_emb is not None:
-            from .embeddings import apply_rotary_emb
+            from diffusers.models.embeddings import apply_rotary_emb
 
             query_org[:, :, text_seq_length:] = apply_rotary_emb(query_org[:, :, text_seq_length:], image_rotary_emb)
             if not attn.is_cross_attention:
@@ -164,8 +165,6 @@ class CogVideoXAttnProcessor2_0:
 
             # Apply RoPE if needed
             if image_rotary_emb is not None:
-                from .embeddings import apply_rotary_emb
-
                 query_ptb[:, :, text_seq_length:] = apply_rotary_emb(query_ptb[:, :, text_seq_length:], image_rotary_emb)
                 if not attn.is_cross_attention:
                     key_ptb[:, :, text_seq_length:] = apply_rotary_emb(key_ptb[:, :, text_seq_length:], image_rotary_emb)
@@ -343,7 +342,92 @@ class FusedCogVideoXAttnProcessor2_0:
         
         return hidden_states, encoder_hidden_states
 
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    sigmas: Optional[List[float]] = None,
+    **kwargs,
+):
+    r"""
+    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+    Args:
+        scheduler (`SchedulerMixin`):
+            The scheduler to get timesteps from.
+        num_inference_steps (`int`):
+            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
+            must be `None`.
+        device (`str` or `torch.device`, *optional*):
+            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+        timesteps (`List[int]`, *optional*):
+            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
+            `num_inference_steps` and `sigmas` must be `None`.
+        sigmas (`List[float]`, *optional*):
+            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
+            `num_inference_steps` and `timesteps` must be `None`.
+
+    Returns:
+        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        second element is the number of inference steps.
+    """
+    if timesteps is not None and sigmas is not None:
+        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif sigmas is not None:
+        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accept_sigmas:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" sigmas schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
+
 class CogVideoXSTGPipeline(CogVideoXPipeline):
+    
+    def extract_layers(self, file_path="./unet_info.txt"):
+        layers = []
+        with open(file_path, "w") as f:
+            for name, module in self.transformer.named_modules():
+                if "attn1" in name and "to" not in name and "add" not in name and "norm" not in name:
+                    f.write(f"{name}\n")
+                    layer_type = name.split(".")[0].split("_")[0]
+                    layers.append((name, module))
+        return layers
+    
+    def init_layer_processor(self, layers):
+        for layer_idx in range(len(layers)):
+            layers[layer_idx][1].processor = CogVideoXAttnProcessor2_0()
+        print(f"[INFO] Initialized layers with CogVideoXAttnProcessor2_0.")
+        return
+    
+    def replace_layer_processor(self, layers, replace_processor, stg_applied_layers_idx=[]):
+        for layer_idx in stg_applied_layers_idx:
+            layers[layer_idx][1].processor = replace_processor
+            print(f"[INFO] Replaced {layer_idx}th layer with CogVideoXSTGAttnProcessor2_0.")
+
+        return
+    
+    @property
+    def do_spatio_temporal_guidance(self):
+        return self._stg_scale > 0.0
     
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -373,8 +457,8 @@ class CogVideoXSTGPipeline(CogVideoXPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 226,
         stg_mode: Optional[str] = "STG-R",
-        stg_applied_layers_idx: Optional[List[int]] = [35],
-        stg_scale: Optional[float] = 1.0,
+        stg_applied_layers_idx: Optional[List[int]] = [30],
+        stg_scale: Optional[float] = 0.0,
         do_rescaling: Optional[bool] = False,
         
     ) -> Union[CogVideoXPipelineOutput, Tuple]:
@@ -485,7 +569,8 @@ class CogVideoXSTGPipeline(CogVideoXPipeline):
 
         if self.do_spatio_temporal_guidance:
             layers = self.extract_layers()
-            replace_processor = STGMochiAttnProcessor2_0(mode=stg_mode)
+            self.init_layer_processor(layers)
+            replace_processor = STGCogVideoXAttnProcessor2_0(mode=stg_mode)
             self.replace_layer_processor(layers, replace_processor, stg_applied_layers_idx)
 
         # 2. Default call parameters
@@ -514,13 +599,11 @@ class CogVideoXSTGPipeline(CogVideoXPipeline):
             max_sequence_length=max_sequence_length,
             device=device,
         )
-        if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
+        if do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
-        elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
+        elif do_classifier_free_guidance and self.do_spatio_temporal_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask, prompt_attention_mask], dim=0)
-
+            
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
         self._num_timesteps = len(timesteps)
@@ -568,9 +651,9 @@ class CogVideoXSTGPipeline(CogVideoXPipeline):
                 if self.interrupt:
                     continue
 
-                if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
+                if do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
                     latent_model_input = torch.cat([latents] * 2)
-                elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
+                elif do_classifier_free_guidance and self.do_spatio_temporal_guidance:
                     latent_model_input = torch.cat([latents] * 3)
                     
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -594,10 +677,10 @@ class CogVideoXSTGPipeline(CogVideoXPipeline):
                     self._guidance_scale = 1 + guidance_scale * (
                         (1 - math.cos(math.pi * ((num_inference_steps - t.item()) / num_inference_steps) ** 5.0)) / 2
                     )
-                if self.do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
+                if do_classifier_free_guidance and not self.do_spatio_temporal_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                elif self.do_classifier_free_guidance and self.do_spatio_temporal_guidance:
+                elif do_classifier_free_guidance and self.do_spatio_temporal_guidance:
                     noise_pred_uncond, noise_pred_text, noise_pred_perturb = noise_pred.chunk(3)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) \
                         + self._stg_scale * (noise_pred_text - noise_pred_perturb)
