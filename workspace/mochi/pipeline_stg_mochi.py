@@ -155,8 +155,8 @@ class STGMochiAttnProcessor2_0:
         if getattr(attn, "to_add_out", None) is not None:
             encoder_hidden_states_org = attn.to_add_out(encoder_hidden_states_org)
 
+        #--------------perturb----------------#
         if self.mode == "STG-A":
-            #--------------ptb----------------#
             query_ptb = attn.to_q(hidden_states_ptb)
             key_ptb = attn.to_k(hidden_states_ptb)
             value_ptb = attn.to_v(hidden_states_ptb)
@@ -228,6 +228,8 @@ class STGMochiAttnProcessor2_0:
 
             if getattr(attn, "to_add_out", None) is not None:
                 encoder_hidden_states_ptb = attn.to_add_out(encoder_hidden_states_ptb)
+
+        #--------------------------------------#
 
         hidden_states = torch.cat([hidden_states_org, hidden_states_ptb], dim=0)
         encoder_hidden_states = torch.cat([encoder_hidden_states_org, encoder_hidden_states_ptb], dim=0)
@@ -325,7 +327,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class STGMochiPipeline(MochiPipeline):
+class MochiSTGPipeline(MochiPipeline):
     def extract_layers(self, file_path="./unet_info.txt"):
         layers = []
         with open(file_path, "w") as f:

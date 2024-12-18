@@ -1,6 +1,6 @@
 import torch
 from diffusers import MochiPipeline
-from pipeline_mochi_stg import STGMochiPipeline
+from pipeline_mochi_stg import MochiSTGPipeline
 from diffusers.utils import export_to_video
 import os
 
