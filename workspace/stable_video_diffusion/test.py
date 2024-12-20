@@ -15,8 +15,8 @@ pipe = StableVideoDiffusionSTGPipeline.from_pretrained(
 pipe = pipe.to("cuda")
 
 # Load the conditioning image
-image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/svd/rocket.png")
-image = image.resize((480, 480))
+image = load_image("https://raw.githubusercontent.com/junhahyung/diffusers/dev/workspace/stable_video_diffusion/assets/sample.png")
+image = image.resize((1024, 512))
 
 generator = torch.manual_seed(42)
 frames = pipe(image, 
@@ -25,9 +25,9 @@ frames = pipe(image,
               stg_mode="STG-A",
               spatial_stg_applied_layers_idx=["u0"],
               temporal_stg_applied_layers_idx=["u0"],
-              spatial_stg_scale=2.0,
-              temporal_stg_scale=0.5,
-              do_rescaling=True,
+              spatial_stg_scale=2.0, # 0.0 (default)
+              temporal_stg_scale=0.5, # 0.0 (default)
+              do_rescaling=True, # False (default)
               ).frames[0]
 
 export_to_video(frames, "generated.mp4", fps=7)
