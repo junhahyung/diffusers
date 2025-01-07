@@ -30,4 +30,4 @@ frames = pipe(image,
               do_rescaling=True, # False (default)
               ).frames[0]
 
-export_to_video(frames, "generated.mp4", fps=7)
+export_to_video(frames, "generated_STG.mp4", fps=7)
